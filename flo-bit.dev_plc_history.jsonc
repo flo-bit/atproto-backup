@@ -1,0 +1,85 @@
+{
+  "alsoKnownAs": [
+    "at://flo-bit.bsky.social"
+  ],
+  "prev": null,
+  "rotationKeys": [
+    "did:key:zQ3shhCGUqDKjStzuDxPkTxN6ujddP4RkEKJJouJGRRkaLGbg",
+    "did:key:zQ3shpKnbdPx3g3CmPf5cRVTPe1HtSwVn5ish3wSnDPQCbLJK"
+  ],
+  "services": {
+    "atproto_pds": {
+      "endpoint": "https://helvella.us-east.host.bsky.network",
+      "type": "AtprotoPersonalDataServer"
+    }
+  },
+  "sig": "ws81Dlj7-WezYMqUmnYk7nL3bqUuQqap4YIlgar-xwYGtOuZSpdlRXyg4Ss_BP-g0J7Q7Kwfxjbb0VajwXEJUw",
+  "type": "plc_operation",
+  "verificationMethods": {
+    "atproto": "did:key:zQ3shku6nTxkKdVARkS96mE9YULakoQyF7c2pbJCbkEPfGDbM"
+  }
+}
+{
+  "alsoKnownAs": [
+    "at://flo-bit.dev"
+  ],
+  "prev": "bafyreigxp5rcufzxb6ad2uhsxh2btd2d6hr64prwnh5znsv43lw5cb4lde",
+  "rotationKeys": [
+    "did:key:zQ3shhCGUqDKjStzuDxPkTxN6ujddP4RkEKJJouJGRRkaLGbg",
+    "did:key:zQ3shpKnbdPx3g3CmPf5cRVTPe1HtSwVn5ish3wSnDPQCbLJK"
+  ],
+  "services": {
+    "atproto_pds": {
+      "endpoint": "https://helvella.us-east.host.bsky.network",
+      "type": "AtprotoPersonalDataServer"
+    }
+  },
+  "sig": "M5YQSanJcY3Lten3M38rx7bfnKW1w8PWh0ZVpRp7k-V2PQpOQLL6AsjwzUy_0wL3BGCMq4zJ6uFTjuzS2YTNdg",
+  "type": "plc_operation",
+  "verificationMethods": {
+    "atproto": "did:key:zQ3shku6nTxkKdVARkS96mE9YULakoQyF7c2pbJCbkEPfGDbM"
+  }
+}
+{
+  "alsoKnownAs": [
+    "at://flo-bit.dev"
+  ],
+  "prev": "bafyreihwjksvbozyq2gbhzqqyrn3uzchoqzcobo3rwglyn3pvrlexcckae",
+  "rotationKeys": [
+    "did:key:zQ3shMW5CAh4bh7dtzz8iNXmJ4v7aLidaZksenvr7jkYCLNbh",
+    "did:key:zQ3shhCGUqDKjStzuDxPkTxN6ujddP4RkEKJJouJGRRkaLGbg",
+    "did:key:zQ3shpKnbdPx3g3CmPf5cRVTPe1HtSwVn5ish3wSnDPQCbLJK"
+  ],
+  "services": {
+    "atproto_pds": {
+      "endpoint": "https://helvella.us-east.host.bsky.network",
+      "type": "AtprotoPersonalDataServer"
+    }
+  },
+  "sig": "YUo-vBxrQar4jtKGsyah693losgnWyjXplMk4U_Pcx9qJOu-udI2jBIS-8IdPXS2SBL2NUD01hpEpHWUqa9MRg",
+  "type": "plc_operation",
+  "verificationMethods": {
+    "atproto": "did:key:zQ3shku6nTxkKdVARkS96mE9YULakoQyF7c2pbJCbkEPfGDbM"
+  }
+}
+{
+  "alsoKnownAs": [
+    "at://flo-bit.dev"
+  ],
+  "prev": "bafyreiccrscnvxupxrk7p3wbf4gputjv46747k7dciatdlkweovaxm545m",
+  "rotationKeys": [
+    "did:key:zQ3shbi8a5JFqtGdjUAjnSET511ZKSxGVw9mDqcr2tNg7v5dL",
+    "did:key:zQ3shnJSPEXuJn5vVyXJDfbfb5AjkakGtcW3g93jXjyxUM4Nr"
+  ],
+  "services": {
+    "atproto_pds": {
+      "endpoint": "https://npmx.social",
+      "type": "AtprotoPersonalDataServer"
+    }
+  },
+  "sig": "kCcXNFfaBdoZs_VuvXUNoIQlug4q6QIHnAPBK3A0WapqUbIfItITllYbk4RZ8JAXNEzDRWIXdFpfzxByTf2L4w",
+  "type": "plc_operation",
+  "verificationMethods": {
+    "atproto": "did:key:zQ3shqbE6gAb5yxY665w8YQJ6inydUbpm3JEKFCWyHvSXc1jD"
+  }
+}

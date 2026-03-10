@@ -1,0 +1,19 @@
+{
+  "did": "did:plc:257wekqxg4hyapkq6k47igmp",
+  "verificationMethods": {
+    "atproto": "did:key:zQ3shqbE6gAb5yxY665w8YQJ6inydUbpm3JEKFCWyHvSXc1jD"
+  },
+  "rotationKeys": [
+    "did:key:zQ3shbi8a5JFqtGdjUAjnSET511ZKSxGVw9mDqcr2tNg7v5dL",
+    "did:key:zQ3shnJSPEXuJn5vVyXJDfbfb5AjkakGtcW3g93jXjyxUM4Nr"
+  ],
+  "alsoKnownAs": [
+    "at://flo-bit.dev"
+  ],
+  "services": {
+    "atproto_pds": {
+      "type": "AtprotoPersonalDataServer",
+      "endpoint": "https://npmx.social"
+    }
+  }
+}
