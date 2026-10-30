@@ -1,0 +1,729 @@
+#!/usr/bin/env bun
+/**
+ * A small, single-file subdomain API backed by an at.marque.dns record.
+ *
+ * Run:
+ *   DNS_DOMAIN=silly.best \
+ *   ATP_PDS_URL=https://pds.example.com \
+ *   ATP_IDENTIFIER=you.example.com \
+ *   ATP_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx \
+ *   bun run server.ts
+ *
+ * Optional:
+ *   DNS_RECORD_RKEY=silly.best       Skip automatic record discovery
+ *   DB_PATH=./dns-api.sqlite         Persistent API-key/claim database
+ *   REGISTRATION_TOKEN=secret        Require X-Registration-Token to claim
+ *   RESERVED_SUBDOMAINS=www,mail     Names that may never be claimed
+ *   PORT=3000 HOST=0.0.0.0
+ */
+
+import {
+  ComAtprotoRepoGetRecord,
+  ComAtprotoRepoListRecords,
+  ComAtprotoRepoPutRecord,
+  ComAtprotoRepoStrongRef,
+} from "@atcute/atproto";
+import { Client, ClientResponseError, ok } from "@atcute/client";
+import type { Cid, RecordKey, ResourceUri } from "@atcute/lexicons";
+import * as v from "@atcute/lexicons/validations";
+import { PasswordSession } from "@atcute/password-session";
+import { Database } from "bun:sqlite";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { isIP } from "node:net";
+import { dirname, resolve } from "node:path";
+
+const env = process.env;
+
+function requiredEnv(name: string): string {
+  const value = env[name]?.trim();
+  if (!value) throw new Error(`Missing required environment variable ${name}`);
+  return value;
+}
+
+function normalizeDomain(value: string): string {
+  const domain = value.trim().toLowerCase().replace(/\.$/, "");
+  if (
+    domain.length > 253 ||
+    !domain.includes(".") ||
+    !domain.split(".").every((label) => /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$/.test(label))
+  ) {
+    throw new Error(`DNS_DOMAIN is not a valid ASCII domain: ${value}`);
+  }
+  return domain;
+}
+
+const DOMAIN = normalizeDomain(requiredEnv("DNS_DOMAIN"));
+const PDS_URL = requiredEnv("ATP_PDS_URL").replace(/\/$/, "");
+const ATP_IDENTIFIER = requiredEnv("ATP_IDENTIFIER");
+const ATP_APP_PASSWORD = requiredEnv("ATP_APP_PASSWORD");
+const CONFIGURED_DNS_RKEY = env.DNS_RECORD_RKEY?.trim() || undefined;
+const REGISTRATION_TOKEN = env.REGISTRATION_TOKEN || undefined;
+const PORT = Number.parseInt(env.PORT || "3000", 10);
+const HOST = env.HOST?.trim() || "0.0.0.0";
+const DB_PATH = env.DB_PATH?.trim() || "./dns-api.sqlite";
+const DEFAULT_TTL = Number.parseInt(env.DEFAULT_TTL || "300", 10);
+const MAX_RECORDS = Number.parseInt(env.MAX_RECORDS_PER_CLAIM || "100", 10);
+const CLAIM_RATE_LIMIT = Number.parseInt(env.CLAIM_RATE_LIMIT_PER_HOUR || "20", 10);
+const MAX_CLAIMS = Number.parseInt(env.MAX_CLAIMS || "10000", 10);
+const RESERVED = new Set(
+  (env.RESERVED_SUBDOMAINS || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean),
+);
+
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error("PORT must be between 1 and 65535");
+if (!Number.isInteger(DEFAULT_TTL) || DEFAULT_TTL < 30 || DEFAULT_TTL > 604800) {
+  throw new Error("DEFAULT_TTL must be between 30 and 604800");
+}
+if (!Number.isInteger(MAX_RECORDS) || MAX_RECORDS < 1 || MAX_RECORDS > 1000) {
+  throw new Error("MAX_RECORDS_PER_CLAIM must be between 1 and 1000");
+}
+
+if (DB_PATH !== ":memory:") mkdirSync(dirname(resolve(DB_PATH)), { recursive: true });
+const db = new Database(DB_PATH, { create: true });
+db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS claims (
+    subdomain TEXT PRIMARY KEY COLLATE NOCASE,
+    api_key_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+`);
+
+interface ClaimRow {
+  subdomain: string;
+  api_key_hash: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface DnsRecord {
+  name: string;
+  recordType: string;
+  ttl: number;
+  value: string;
+}
+
+// at.marque.dns is not in a published definition package, so its record
+// Lexicon lives inline while the com.atproto.* procedures come from Atcute.
+const AtMarqueDnsSchema = v.record(
+  v.recordKeyString(),
+  v.object({
+    $type: v.literal("at.marque.dns"),
+    createdAt: v.datetimeString(),
+    domain: v.string(),
+    records: v.array(
+      v.object({
+        name: v.string(),
+        recordType: v.string(),
+        ttl: v.integer(),
+        value: v.string(),
+      }),
+    ),
+    subject: ComAtprotoRepoStrongRef.mainSchema,
+  }),
+);
+
+type AtMarqueDnsRecord = v.InferOutput<typeof AtMarqueDnsSchema>;
+
+declare module "@atcute/lexicons/ambient" {
+  interface Records {
+    "at.marque.dns": typeof AtMarqueDnsSchema;
+  }
+}
+
+interface RepoRecord {
+  uri: ResourceUri;
+  cid: Cid;
+  value: AtMarqueDnsRecord;
+}
+
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+    readonly headers?: HeadersInit,
+  ) {
+    super(message);
+  }
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function constantEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  if (left.length !== right.length) {
+    timingSafeEqual(left, left);
+    return false;
+  }
+  return timingSafeEqual(left, right);
+}
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+function json(data: unknown, status = 200, headers?: HeadersInit): Response {
+  const responseHeaders = new Headers(headers);
+  responseHeaders.set("content-type", "application/json; charset=utf-8");
+  responseHeaders.set("cache-control", "no-store");
+  return new Response(JSON.stringify(data, null, 2) + "\n", { status, headers: responseHeaders });
+}
+
+function getClaim(subdomain: string): ClaimRow | null {
+  return (db.query("SELECT * FROM claims WHERE subdomain = ?").get(subdomain) as ClaimRow | null) || null;
+}
+
+function validateSubdomain(input: unknown, enforceReserved = false): string {
+  if (typeof input !== "string") throw new HttpError(400, "invalid_subdomain", "subdomain must be a string");
+  const value = input.trim().toLowerCase();
+  if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$/.test(value)) {
+    throw new HttpError(400, "invalid_subdomain", "subdomain must be one ASCII DNS label (letters, digits, or hyphens)");
+  }
+  if (`${value}.${DOMAIN}`.length > 253) throw new HttpError(400, "invalid_subdomain", "resulting domain is too long");
+  if (enforceReserved && RESERVED.has(value)) throw new HttpError(409, "reserved_subdomain", `${value}.${DOMAIN} is reserved`);
+  return value;
+}
+
+function validateRelativeName(input: unknown, subdomain: string): string {
+  if (input === undefined) return "@";
+  if (typeof input !== "string") throw new HttpError(400, "invalid_record", "record name must be a string");
+  const value = input.trim().toLowerCase();
+  if (value === "@") return value;
+  if (!value || value.endsWith(".")) {
+    throw new HttpError(400, "invalid_record", "record names must be relative names such as @, www, or _acme-challenge.www");
+  }
+
+  const labels = value.split(".");
+  for (const [index, label] of labels.entries()) {
+    if (label === "*" && index === 0) continue;
+    if (!/^(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)$/.test(label)) {
+      throw new HttpError(400, "invalid_record", `invalid DNS label in record name: ${label || "(empty)"}`);
+    }
+  }
+
+  if (`${value}.${subdomain}.${DOMAIN}`.length > 253) throw new HttpError(400, "invalid_record", `record name is too long: ${value}`);
+  return value;
+}
+
+const ALLOWED_RECORD_TYPES = new Set(["A", "AAAA", "CAA", "CNAME", "HTTPS", "MX", "NS", "PTR", "SRV", "SVCB", "TXT"]);
+
+function inferRecordType(value: string): string {
+  const ipVersion = isIP(value.trim());
+  return ipVersion === 4 ? "A" : ipVersion === 6 ? "AAAA" : "CNAME";
+}
+
+function assertRecordSet(records: DnsRecord[]): void {
+  if (records.length > MAX_RECORDS) {
+    throw new HttpError(400, "too_many_records", `a claim may have at most ${MAX_RECORDS} records`);
+  }
+
+  const exact = new Set<string>();
+  const byName = new Map<string, DnsRecord[]>();
+  for (const record of records) {
+    const signature = JSON.stringify([record.name, record.recordType, record.ttl, record.value]);
+    if (exact.has(signature)) throw new HttpError(400, "duplicate_record", `duplicate ${record.recordType} record at ${record.name}`);
+    exact.add(signature);
+    const group = byName.get(record.name) || [];
+    group.push(record);
+    byName.set(record.name, group);
+  }
+
+  for (const [name, group] of byName) {
+    const cnames = group.filter((record) => record.recordType === "CNAME");
+    if (cnames.length > 1 || (cnames.length === 1 && group.length !== 1)) {
+      throw new HttpError(400, "cname_conflict", `CNAME at ${name} cannot coexist with another record`);
+    }
+  }
+}
+
+function parseRecords(body: Record<string, unknown>, subdomain: string, allowEmpty: boolean): DnsRecord[] {
+  let inputs: unknown[];
+  if (Array.isArray(body.records)) {
+    inputs = body.records;
+  } else {
+    const directValue = body.value ?? body.target;
+    if (directValue === undefined) {
+      if (allowEmpty) inputs = [];
+      else throw new HttpError(400, "missing_records", "provide records, value, or target");
+    } else {
+      inputs = [{ name: "@", recordType: body.recordType ?? body.type, ttl: body.ttl, value: directValue }];
+    }
+  }
+
+  if (!allowEmpty && inputs.length === 0) throw new HttpError(400, "missing_records", "at least one record is required");
+
+  const records = inputs.map((input, index): DnsRecord => {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new HttpError(400, "invalid_record", `records[${index}] must be an object`);
+    }
+    const source = input as Record<string, unknown>;
+    const name = validateRelativeName(source.name, subdomain);
+    if (typeof source.value !== "string" || !source.value.trim()) {
+      throw new HttpError(400, "invalid_record", `records[${index}].value must be a non-empty string`);
+    }
+    if (Buffer.byteLength(source.value, "utf8") > 4096) {
+      throw new HttpError(400, "invalid_record", `records[${index}].value is too large`);
+    }
+
+    const recordType = String(source.recordType ?? source.type ?? inferRecordType(source.value)).toUpperCase();
+    if (!ALLOWED_RECORD_TYPES.has(recordType)) {
+      throw new HttpError(400, "invalid_record", `unsupported record type ${recordType}`);
+    }
+    if (recordType === "A" && isIP(source.value.trim()) !== 4) {
+      throw new HttpError(400, "invalid_record", `A record at ${name} does not contain an IPv4 address`);
+    }
+    if (recordType === "AAAA" && isIP(source.value.trim()) !== 6) {
+      throw new HttpError(400, "invalid_record", `AAAA record at ${name} does not contain an IPv6 address`);
+    }
+
+    const ttl = source.ttl === undefined ? DEFAULT_TTL : Number(source.ttl);
+    if (!Number.isInteger(ttl) || ttl < 30 || ttl > 604800) {
+      throw new HttpError(400, "invalid_record", `records[${index}].ttl must be an integer from 30 to 604800`);
+    }
+
+    return { name, recordType, ttl, value: source.value };
+  });
+
+  assertRecordSet(records);
+  return records;
+}
+
+async function readBody(req: Request): Promise<Record<string, unknown>> {
+  const declaredLength = Number(req.headers.get("content-length") || 0);
+  if (declaredLength > 64 * 1024) throw new HttpError(413, "body_too_large", "request body may not exceed 64 KiB");
+  const text = await req.text();
+  if (Buffer.byteLength(text, "utf8") > 64 * 1024) throw new HttpError(413, "body_too_large", "request body may not exceed 64 KiB");
+  try {
+    const body = JSON.parse(text || "{}");
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error();
+    return body as Record<string, unknown>;
+  } catch {
+    throw new HttpError(400, "invalid_json", "request body must be a JSON object");
+  }
+}
+
+function apiKeyFromRequest(req: Request): string | null {
+  const explicit = req.headers.get("x-api-key")?.trim();
+  if (explicit) return explicit;
+  const authorization = req.headers.get("authorization") || "";
+  const match = /^Bearer\s+(.+)$/i.exec(authorization);
+  return match?.[1]?.trim() || null;
+}
+
+function authenticate(req: Request, subdomain: string): ClaimRow {
+  const row = getClaim(subdomain);
+  const key = apiKeyFromRequest(req);
+  if (!row || !key || !constantEqual(row.api_key_hash, sha256(key))) {
+    throw new HttpError(401, "invalid_api_key", "use this claim's API key as Authorization: Bearer <key> or X-API-Key", {
+      "www-authenticate": "Bearer",
+    });
+  }
+  return row;
+}
+
+function requireRegistrationToken(req: Request): void {
+  if (!REGISTRATION_TOKEN) return;
+  const supplied = req.headers.get("x-registration-token") || "";
+  if (!constantEqual(supplied, REGISTRATION_TOKEN)) {
+    throw new HttpError(401, "invalid_registration_token", "a valid X-Registration-Token header is required");
+  }
+}
+
+class DnsStore {
+  private discoveredRkey?: RecordKey;
+
+  constructor(
+    private readonly rpc: Client,
+    private readonly session: PasswordSession,
+  ) {}
+
+  private async discoverRkey(): Promise<RecordKey> {
+    if (this.discoveredRkey) return this.discoveredRkey;
+
+    if (CONFIGURED_DNS_RKEY) {
+      const configured = v.safeParse(AtMarqueDnsSchema.key, CONFIGURED_DNS_RKEY);
+      if (!configured.ok) throw new HttpError(503, "invalid_dns_rkey", "DNS_RECORD_RKEY is not a valid ATProto record key");
+      this.discoveredRkey = configured.value;
+      return configured.value;
+    }
+
+    let cursor: string | undefined;
+    let match: { uri: ResourceUri; value: unknown } | undefined;
+
+    do {
+      const page = await ok(
+        this.rpc.call(ComAtprotoRepoListRecords, {
+          params: {
+            repo: this.session.did,
+            collection: "at.marque.dns",
+            limit: 100,
+            cursor,
+          },
+        }),
+      );
+      for (const record of page.records) {
+        if (domainFromRecord(record.value) === DOMAIN) {
+          if (match) throw new HttpError(503, "duplicate_dns_records", `more than one at.marque.dns record manages ${DOMAIN}`);
+          match = record;
+        }
+      }
+      cursor = page.cursor;
+    } while (cursor);
+
+    if (!match) throw new HttpError(503, "dns_record_not_found", `no at.marque.dns record for ${DOMAIN} was found in the configured account`);
+
+    const parsedRkey = v.safeParse(AtMarqueDnsSchema.key, decodeURIComponent(match.uri.split("/").pop() || ""));
+    if (!parsedRkey.ok) throw new HttpError(503, "invalid_dns_record", "could not determine the at.marque.dns record key");
+    this.discoveredRkey = parsedRkey.value;
+    return parsedRkey.value;
+  }
+
+  async get(): Promise<RepoRecord> {
+    const record = await ok(
+      this.rpc.call(ComAtprotoRepoGetRecord, {
+        params: {
+          repo: this.session.did,
+          collection: "at.marque.dns",
+          rkey: await this.discoverRkey(),
+        },
+      }),
+    );
+    if (!record.cid) throw new HttpError(503, "invalid_dns_record", "the at.marque.dns record has no CID");
+
+    const parsedValue = v.safeParse(AtMarqueDnsSchema, record.value);
+    if (!parsedValue.ok || parsedValue.value.domain.toLowerCase().replace(/\.$/, "") !== DOMAIN) {
+      throw new HttpError(503, "invalid_dns_record", `the configured record is not a valid at.marque.dns record for ${DOMAIN}`);
+    }
+
+    return { uri: record.uri, cid: record.cid, value: parsedValue.value };
+  }
+
+  async setNamespace(subdomain: string, desiredRelative: DnsRecord[], requireEmpty = false): Promise<RepoRecord> {
+    const desired = desiredRelative.map((record) => ({
+      name: record.name === "@" ? subdomain : `${record.name}.${subdomain}`,
+      recordType: record.recordType,
+      ttl: record.ttl,
+      value: record.value,
+    }));
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const current = await this.get();
+      const currentRecords = current.value.records;
+      const owned = currentRecords.filter((record) => isOwnedRecord(record, subdomain));
+      if (requireEmpty && owned.length > 0) {
+        throw new HttpError(409, "subdomain_in_use", `${subdomain}.${DOMAIN} already has DNS records`);
+      }
+      if (sameRecordSet(owned, desired)) return current;
+
+      const nextRecords = currentRecords.filter((record) => !isOwnedRecord(record, subdomain)).concat(desired);
+      const nextValue: AtMarqueDnsRecord = { ...current.value, records: nextRecords };
+
+      try {
+        const result = await ok(
+          this.rpc.call(ComAtprotoRepoPutRecord, {
+            input: {
+              repo: this.session.did,
+              collection: "at.marque.dns",
+              rkey: await this.discoverRkey(),
+              validate: false,
+              record: nextValue,
+              swapRecord: current.cid,
+            },
+          }),
+        );
+        return { uri: result.uri, cid: result.cid, value: nextValue };
+      } catch (error) {
+        if (error instanceof ClientResponseError && error.error === "InvalidSwap") {
+          await Bun.sleep(20 + Math.random() * 80);
+          continue;
+        }
+
+        // A dropped response can hide a successful write. Treat the operation as
+        // successful if a fresh read shows exactly the requested namespace.
+        try {
+          const latest = await this.get();
+          const latestOwned = latest.value.records.filter((record) => isOwnedRecord(record, subdomain));
+          if (sameRecordSet(latestOwned, desired)) return latest;
+        } catch {
+          // Preserve the original, more useful error.
+        }
+        throw error;
+      }
+    }
+    throw new HttpError(409, "concurrent_update", "the DNS record changed too many times; retry the request");
+  }
+
+  async relativeRecords(subdomain: string): Promise<DnsRecord[]> {
+    const document = await this.get();
+    return document.value.records
+      .filter((record) => isOwnedRecord(record, subdomain))
+      .map((record) => toRelativeRecord(record, subdomain));
+  }
+}
+
+function domainFromRecord(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const domain = (value as Record<string, unknown>).domain;
+  return typeof domain === "string" ? domain.toLowerCase().replace(/\.$/, "") : "";
+}
+
+function recordName(record: unknown): string | null {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+  const name = (record as Record<string, unknown>).name;
+  return typeof name === "string" ? name.toLowerCase() : null;
+}
+
+function isOwnedRecord(record: unknown, subdomain: string): boolean {
+  const name = recordName(record);
+  return name === subdomain || Boolean(name?.endsWith(`.${subdomain}`));
+}
+
+function toRelativeRecord(record: DnsRecord, subdomain: string): DnsRecord {
+  const lowerName = record.name.toLowerCase();
+  return {
+    name: lowerName === subdomain ? "@" : lowerName.slice(0, -(subdomain.length + 1)),
+    recordType: String(record.recordType).toUpperCase(),
+    ttl: Number(record.ttl),
+    value: String(record.value),
+  };
+}
+
+function sameRecordSet(left: unknown[], right: unknown[]): boolean {
+  const canonical = (records: unknown[]) => records.map((record) => JSON.stringify(record)).sort().join("\n");
+  return canonical(left) === canonical(right);
+}
+
+const passwordSession = await PasswordSession.login({
+  service: PDS_URL,
+  identifier: ATP_IDENTIFIER,
+  password: ATP_APP_PASSWORD,
+});
+const rpc = new Client({ handler: passwordSession });
+const dns = new DnsStore(rpc, passwordSession);
+
+let mutationTail: Promise<void> = Promise.resolve();
+async function serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = mutationTail;
+  let release!: () => void;
+  mutationTail = new Promise<void>((resolve) => (release = resolve));
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+const claimRates = new Map<string, { startedAt: number; count: number }>();
+function consumeClaimRate(address: string): void {
+  if (CLAIM_RATE_LIMIT <= 0) return;
+  const timestamp = Date.now();
+  const current = claimRates.get(address);
+  if (!current || timestamp - current.startedAt >= 60 * 60_000) {
+    claimRates.set(address, { startedAt: timestamp, count: 1 });
+    return;
+  }
+  if (current.count >= CLAIM_RATE_LIMIT) throw new HttpError(429, "rate_limited", "too many claim attempts; try again later");
+  current.count++;
+}
+
+function claimResponse(subdomain: string, records: DnsRecord[]): Record<string, unknown> {
+  return { subdomain, domain: `${subdomain}.${DOMAIN}`, records };
+}
+
+const apiDescription = {
+  name: "subdomain API",
+  baseDomain: DOMAIN,
+  registrationTokenRequired: Boolean(REGISTRATION_TOKEN),
+  authentication: "After claiming, send the returned key as Authorization: Bearer <apiKey> or X-API-Key.",
+  recordNames: "Record names are relative to the claim: @ is the claimed subdomain, www is a sub-subdomain, and * is a wildcard.",
+  endpoints: [
+    { method: "POST", path: "/v1/subdomains", body: { subdomain: "demo", records: [{ name: "@", recordType: "A", ttl: 300, value: "192.0.2.1" }] }, description: "Claim a name; the API key is returned once." },
+    { method: "GET", path: "/v1/subdomains/:subdomain", description: "Read the claim's live DNS records (requires its API key)." },
+    { method: "PUT", path: "/v1/subdomains/:subdomain", body: { records: [] }, description: "Replace all records. An empty list keeps the claim reserved." },
+    { method: "POST", path: "/v1/subdomains/:subdomain/records", body: { records: [{ name: "www", recordType: "CNAME", value: "example.com", ttl: 300 }] }, description: "Add records, replacing records with the same name and type." },
+    { method: "DELETE", path: "/v1/subdomains/:subdomain/records?name=www&recordType=CNAME", description: "Remove records by relative name and optional type." },
+    { method: "POST", path: "/v1/subdomains/:subdomain/rotate-key", description: "Rotate and return the claim's API key." },
+    { method: "DELETE", path: "/v1/subdomains/:subdomain", description: "Remove all records and release the name." },
+  ],
+};
+
+async function handle(req: Request, server: Bun.Server<undefined>): Promise<Response> {
+  const url = new URL(req.url);
+  const parts = url.pathname.split("/").filter(Boolean).map((part) => {
+    try {
+      return decodeURIComponent(part);
+    } catch {
+      throw new HttpError(400, "invalid_path", "path contains invalid percent encoding");
+    }
+  });
+
+  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/docs.json")) return json(apiDescription);
+  if (req.method === "GET" && url.pathname === "/health") return json({ ok: true, domain: DOMAIN });
+
+  if (req.method === "POST" && parts.length === 2 && parts[0] === "v1" && parts[1] === "subdomains") {
+    requireRegistrationToken(req);
+    consumeClaimRate(server.requestIP(req)?.address || "unknown");
+    const body = await readBody(req);
+    const subdomain = validateSubdomain(body.subdomain ?? body.name, true);
+    const records = parseRecords(body, subdomain, false);
+
+    return serializeMutation(async () => {
+      if (getClaim(subdomain)) throw new HttpError(409, "subdomain_in_use", `${subdomain}.${DOMAIN} is already claimed`);
+      const count = (db.query("SELECT COUNT(*) AS count FROM claims").get() as { count: number }).count;
+      if (count >= MAX_CLAIMS) throw new HttpError(503, "claim_limit_reached", "this service is not accepting more claims");
+
+      const apiKey = `dns_${randomBytes(32).toString("base64url")}`;
+      const keyHash = sha256(apiKey);
+      const timestamp = now();
+      try {
+        db.query("INSERT INTO claims (subdomain, api_key_hash, created_at, updated_at) VALUES (?, ?, ?, ?)").run(
+          subdomain,
+          keyHash,
+          timestamp,
+          timestamp,
+        );
+      } catch {
+        throw new HttpError(409, "subdomain_in_use", `${subdomain}.${DOMAIN} is already claimed`);
+      }
+
+      try {
+        await dns.setNamespace(subdomain, records, true);
+      } catch (error) {
+        db.query("DELETE FROM claims WHERE subdomain = ? AND api_key_hash = ?").run(subdomain, keyHash);
+        throw error;
+      }
+
+      return json(
+        {
+          ...claimResponse(subdomain, records),
+          apiKey,
+          warning: "Save this API key now. It cannot be recovered, only rotated.",
+        },
+        201,
+        { location: `/v1/subdomains/${subdomain}` },
+      );
+    });
+  }
+
+  if (parts.length >= 3 && parts[0] === "v1" && parts[1] === "subdomains") {
+    const subdomain = validateSubdomain(parts[2]);
+    const row = authenticate(req, subdomain);
+
+    if (parts.length === 3 && req.method === "GET") {
+      const records = await dns.relativeRecords(subdomain);
+      return json({ ...claimResponse(subdomain, records), createdAt: row.created_at, updatedAt: row.updated_at });
+    }
+
+    if (parts.length === 3 && req.method === "PUT") {
+      const body = await readBody(req);
+      const records = parseRecords(body, subdomain, true);
+      return serializeMutation(async () => {
+        authenticate(req, subdomain);
+        await dns.setNamespace(subdomain, records);
+        const timestamp = now();
+        db.query("UPDATE claims SET updated_at = ? WHERE subdomain = ?").run(timestamp, subdomain);
+        return json({ ...claimResponse(subdomain, records), updatedAt: timestamp });
+      });
+    }
+
+    if (parts.length === 3 && req.method === "DELETE") {
+      return serializeMutation(async () => {
+        // Re-authenticate after waiting for earlier mutations.
+        const current = authenticate(req, subdomain);
+        await dns.setNamespace(subdomain, []);
+        db.query("DELETE FROM claims WHERE subdomain = ? AND api_key_hash = ?").run(subdomain, current.api_key_hash);
+        return new Response(null, { status: 204 });
+      });
+    }
+
+    if (parts.length === 4 && parts[3] === "records" && req.method === "POST") {
+      const body = await readBody(req);
+      const incoming = parseRecords(body, subdomain, false);
+      return serializeMutation(async () => {
+        authenticate(req, subdomain);
+        const current = await dns.relativeRecords(subdomain);
+        const replacementKeys = new Set(incoming.map((record) => `${record.name}\0${record.recordType}`));
+        const records = current.filter((record) => !replacementKeys.has(`${record.name}\0${record.recordType}`)).concat(incoming);
+        assertRecordSet(records);
+        await dns.setNamespace(subdomain, records);
+        const timestamp = now();
+        db.query("UPDATE claims SET updated_at = ? WHERE subdomain = ?").run(timestamp, subdomain);
+        return json({ ...claimResponse(subdomain, records), updatedAt: timestamp });
+      });
+    }
+
+    if (parts.length === 4 && parts[3] === "records" && req.method === "DELETE") {
+      const names = url.searchParams.getAll("name").map((name) => validateRelativeName(name, subdomain));
+      if (names.length === 0) throw new HttpError(400, "missing_name", "provide at least one name query parameter");
+      const requestedType = url.searchParams.get("recordType")?.toUpperCase();
+      if (requestedType && !ALLOWED_RECORD_TYPES.has(requestedType)) {
+        throw new HttpError(400, "invalid_record", `unsupported record type ${requestedType}`);
+      }
+      const nameSet = new Set(names);
+
+      return serializeMutation(async () => {
+        authenticate(req, subdomain);
+        const current = await dns.relativeRecords(subdomain);
+        const records = current.filter(
+          (record) => !nameSet.has(record.name) || Boolean(requestedType && record.recordType !== requestedType),
+        );
+        await dns.setNamespace(subdomain, records);
+        const timestamp = now();
+        db.query("UPDATE claims SET updated_at = ? WHERE subdomain = ?").run(timestamp, subdomain);
+        return json({ ...claimResponse(subdomain, records), updatedAt: timestamp });
+      });
+    }
+
+    if (parts.length === 4 && parts[3] === "rotate-key" && req.method === "POST") {
+      return serializeMutation(async () => {
+        const current = authenticate(req, subdomain);
+        const apiKey = `dns_${randomBytes(32).toString("base64url")}`;
+        const timestamp = now();
+        db.query("UPDATE claims SET api_key_hash = ?, updated_at = ? WHERE subdomain = ? AND api_key_hash = ?").run(
+          sha256(apiKey),
+          timestamp,
+          subdomain,
+          current.api_key_hash,
+        );
+        return json({ subdomain, domain: `${subdomain}.${DOMAIN}`, apiKey, updatedAt: timestamp });
+      });
+    }
+  }
+
+  throw new HttpError(404, "not_found", "route not found; GET / for API documentation");
+}
+
+const server = Bun.serve({
+  hostname: HOST,
+  port: PORT,
+  async fetch(req, server) {
+    try {
+      return await handle(req, server);
+    } catch (error) {
+      if (error instanceof HttpError) return json({ error: error.code, message: error.message }, error.status, error.headers);
+      if (error instanceof ClientResponseError) {
+        console.error(`PDS error: ${error.error}: ${error.description || error.message}`);
+        return json(
+          { error: "pds_error", message: `DNS backend rejected the operation: ${error.description || error.message}` },
+          502,
+        );
+      }
+      console.error(error);
+      return json({ error: "internal_error", message: "internal server error" }, 500);
+    }
+  },
+});
+
+console.log(`subdomain API listening on http://${server.hostname}:${server.port}`);
+console.log(`authenticated with Atcute as ${passwordSession.did}`);
+console.log(`managing *.${DOMAIN} through ${passwordSession.dispatchUrl}`);
+console.log(`claim database: ${DB_PATH}`);

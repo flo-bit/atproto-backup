@@ -1,0 +1,33 @@
+type Mood = "caffeinated" | "decaf" | "panicking";
+
+interface Developer {
+  name: string;
+  mood: Mood;
+  bugsCreated: number;
+  bugsFixed: number;
+}
+
+const me: Developer = {
+  name: "Dev McCoderson",
+  mood: "panicking",
+  bugsCreated: 42,
+  bugsFixed: 41, // so close
+};
+
+function fixBug(dev: Developer): Developer {
+  const success = Math.random() > 0.5;
+  return {
+    ...dev,
+    bugsFixed: dev.bugsFixed + (success ? 1 : 0),
+    bugsCreated: dev.bugsCreated + (success ? 0 : 2), // classic
+    mood: success ? "caffeinated" : "panicking",
+  };
+}
+
+let state = me;
+while (state.bugsFixed < state.bugsCreated) {
+  state = fixBug(state);
+  console.log(`Bugs remaining: ${state.bugsCreated - state.bugsFixed} 🐛`);
+}
+
+console.log("All bugs fixed! (citation needed)");

@@ -1,0 +1,149 @@
+// coffee_shop.rs — A wildly over-engineered coffee shop simulator
+// (purely for the noble cause of testing syntax highlighting)
+
+use std::collections::HashMap;
+use std::fmt;
+
+const MAX_PATIENCE: u8 = 100;
+const GROUCHY_THRESHOLD: u8 = 30;
+
+/// The only three states a human truly knows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mood {
+    Delighted,
+    Tolerable,
+    Feral,
+}
+
+#[derive(Debug, Clone)]
+enum Drink {
+    Espresso,
+    Latte { oat_milk: bool, pumps: u8 },
+    ColdBrew(u32), // milliliters of pure resolve
+    MysteryBlend(String),
+}
+
+impl fmt::Display for Drink {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Drink::Espresso => write!(f, "a tiny cup of bravery"),
+            Drink::Latte { oat_milk, pumps } => {
+                let milk = if *oat_milk { "oat" } else { "regular" };
+                write!(f, "a {milk}-milk latte with {pumps} pumps of chaos")
+            }
+            Drink::ColdBrew(ml) => write!(f, "{ml}ml of cold determination"),
+            Drink::MysteryBlend(name) => write!(f, "the legendary '{name}'"),
+        }
+    }
+}
+
+struct Customer {
+    name: String,
+    patience: u8,
+    order: Drink,
+}
+
+impl Customer {
+    fn new(name: &str, order: Drink) -> Self {
+        Customer {
+            name: name.to_string(),
+            patience: MAX_PATIENCE,
+            order,
+        }
+    }
+
+    fn mood(&self) -> Mood {
+        match self.patience {
+            p if p > 70 => Mood::Delighted,
+            p if p > GROUCHY_THRESHOLD => Mood::Tolerable,
+            _ => Mood::Feral,
+        }
+    }
+
+    fn wait(&mut self, ticks: u8) {
+        self.patience = self.patience.saturating_sub(ticks * 7);
+    }
+}
+
+#[derive(Default)]
+struct Barista {
+    name: String,
+    drinks_made: u32,
+    tips: f64,
+}
+
+impl Barista {
+    fn brew(&mut self, customer: &Customer) -> String {
+        self.drinks_made += 1;
+        let reaction = match customer.mood() {
+            Mood::Delighted => {
+                self.tips += 2.50;
+                "beams ✨"
+            }
+            Mood::Tolerable => {
+                self.tips += 0.25;
+                "nods politely"
+            }
+            Mood::Feral => {
+                self.tips -= 1.0; // they took a tip back, somehow
+                "audibly sighs"
+            }
+        };
+        format!(
+            "{} makes {} for {} who {}",
+            self.name, customer.order, customer.name, reaction
+        )
+    }
+}
+
+fn build_queue() -> Vec<Customer> {
+    vec![
+        Customer::new("Alice", Drink::Espresso),
+        Customer::new("Bob", Drink::Latte { oat_milk: true, pumps: 4 }),
+        Customer::new("Carol", Drink::ColdBrew(500)),
+        Customer::new("Dave", Drink::MysteryBlend("The Widowmaker".to_string())),
+        Customer::new("Eve", Drink::Latte { oat_milk: false, pumps: 1 }),
+    ]
+}
+
+fn main() {
+    let mut barista = Barista {
+        name: "Sam".to_string(),
+        ..Default::default()
+    };
+
+    let mut queue = build_queue();
+    let mut mood_log: HashMap<&str, u32> = HashMap::new();
+
+    println!("☕ Opening the shop. {} customers waiting.\n", queue.len());
+
+    for (position, customer) in queue.iter_mut().enumerate() {
+        // The further back you are, the longer you suffer.
+        customer.wait(position as u8);
+
+        let mood_label = match customer.mood() {
+            Mood::Delighted => "delighted",
+            Mood::Tolerable => "tolerable",
+            Mood::Feral => "feral",
+        };
+        *mood_log.entry(mood_label).or_insert(0) += 1;
+
+        println!("[{position}] {}", barista.brew(customer));
+    }
+
+    println!("\n--- End of Day Report ---");
+    println!("Drinks made:  {}", barista.drinks_made);
+    println!("Tips earned:  ${:.2}", barista.tips);
+
+    let mut moods: Vec<(&&str, &u32)> = mood_log.iter().collect();
+    moods.sort_by(|a, b| b.1.cmp(a.1));
+    for (mood, count) in moods {
+        println!("  {count} customer(s) left {mood}");
+    }
+
+    if barista.tips < 0.0 {
+        println!("\nSam is reconsidering their career. 🫠");
+    } else {
+        println!("\nSam survived. Barely. 🎉");
+    }
+}
