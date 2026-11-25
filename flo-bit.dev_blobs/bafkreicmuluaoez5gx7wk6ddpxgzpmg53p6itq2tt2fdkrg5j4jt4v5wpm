@@ -1,0 +1,52 @@
+Hey — this is a copy-paste guide on how building apps on atproto can work easily and cheaply, with no backend or database to run.
+
+The user should have written their app idea above (or is about to). **First, check whether that idea actually works with this simple setup.** If it doesn't — or only partially does — tell them plainly why and suggest concrete alternatives: either ways to adapt or simplify the app so it fits, or a different way to build it (see "When you need more" and "Spaces" below).
+
+Reply in the language the user wrote their idea in. Ask whatever clarifying questions you need — in particular, **ask for the user's handle if the app is about them** (e.g. a guestbook, profile page, or personal board; never guess it from git config). Keep v1 small and working.
+
+## The easy, cheap setup (static app, no backend)
+
+These ideas fit especially well: small social or community tools, personal dashboards, and **tiny website extras** like blog comments, [standard.site](https://standard.site) publishing, a guestbook, or a live Jetstream visualizer (read-only ones need no login at all).
+
+- **Browser-only OAuth:** People sign in with their own atproto/Bluesky account right in the browser. Request narrow scopes (`atproto` + only the `repo:<collection>` you write), not broad access.
+- **User-owned storage (PDS):** Each person's data lives as JSON records in their own Personal Data Server (`createRecord`, `putRecord`, `deleteRecord`). **Normal repo records are public.**
+- **Reading data without an AppView:**
+  - **One person's records:** directly from their PDS (`listRecords`, `getRecord`).
+  - **Handle ↔ DID ↔ PDS, or a record by AT URI:** Slingshot ([microcosm.blue](https://www.microcosm.blue)).
+  - **Backlinks ("who commented / liked / voted / RSVP'd to X"):** Constellation ([microcosm.blue](https://www.microcosm.blue)) — works whenever records reference an AT URI, DID, or URL.
+  - **Recent records globally:** UFOs ([microcosm.blue](https://www.microcosm.blue)) — recent only, not full history.
+  - **Live stream:** Jetstream WebSocket (public JSON stream filterable by collection, no auth needed).
+  - **Profiles & existing app data:** public APIs (e.g. Bluesky's `app.bsky.actor.getProfiles`).
+- **No-server moderation:** For owner-moderated apps like guestbooks or comments, the owner can't delete other people's records — store a hidden list of removed record URIs (or blocked DIDs) in the owner's own account and filter them out in the UI.
+- **Hosting:** Any static host, or [Wisp](https://wisp.place) (`wispctl`), which hosts static sites for free directly inside the user's atproto account.
+
+## When you need more (suggest these if the idea doesn't fit)
+
+- **Global search, arbitrary filtering/sorting across everyone, or full history:** Redesign queries around per-user lists and Constellation backlinks if possible — otherwise add an index/AppView like [Contrail](https://github.com/flo-bit/contrail) (`@atmo-dev/contrail`) or [Happyview](https://happyview.dev).
+- **Private or shared (non-public) data:** Normal repos are public — use **Spaces** (below), keep data local in the browser, or add a backend.
+- **Server secrets, third-party APIs, cron jobs, notifications, or app-wide / multi-moderator moderation:** Add a small backend (e.g. Cloudflare Workers + server-side OAuth) — or use atproto **only for OAuth login** alongside a regular database.
+
+## Private & shared data: Spaces
+
+**Spaces** add permissioned, access-controlled repos on each user's PDS, kept off the public firehose — great for personal data (notes, drafts, bookmarks) and small family/friends apps (photo album, shopping list, film club) without running a database.
+
+- **Availability & privacy:** Public beta is scheduled for **Dec 1, 2026** — check whether the user's PDS supports Spaces yet; if not, offer the alpha PDS (`https://spaces-alpha.host.bsky.network`, `alpha` npm tag), local browser storage for now, or waiting. **Never silently fall back to public repos.** Spaces are access-controlled by the PDS, **not end-to-end encrypted** (if E2E is needed, say so and suggest client-side encryption or another approach).
+- **How to use them:** A Space lives at `at://{authorityDid}/space/{spaceType}/{skey}` (each member writes into their own repo on their own PDS) with `personalspace` (owner-only), `memberspace` (explicit member list — works directly from the browser for small groups), or `managedspace` (server-authorized via `checkAccess`) policies. Publish a `"type": "space"` Lexicon (with `_lexicon` DNS TXT on a domain the user owns), request `space:` OAuth scopes (`space:<spaceType>` or `space:<spaceType>?authority=*`, plus `&manage=create&manage=update` and `blob:` scopes as needed), and use `@atproto/lex` + `@atproto/lex-space` (`SpaceClient`, `SpaceManager`, `SpaceReader`; spec: `https://github.com/bluesky-social/proposals/tree/main/0016-permissioned-data`).
+
+## Schemas (Lexicons)
+
+- **Search existing schemas first:** Call `search_lexicons` (semantic mode) on `POST https://lexicon.garden/mcp`, then `com.atproto.lexicon.resolveLexicon` to inspect a schema (or browse [lexicon.garden](https://lexicon.garden) — skip `llms.txt`, it's a huge list of every schema).
+- **Weigh reuse trade-offs:** Reusing a schema lets data show up across apps, but you don't control it and records from other apps using it will show up in yours. Prefer schemas published by the domain owner whose shape works with backlinks (a `subject` or `uri` field).
+- **Otherwise create one** using reverse-DNS under a domain the user owns (`example.com` → `com.example.thing`). For public repos, schemas work without publishing; if the user has no domain, use a placeholder and mention that changing it later means migrating records. Always include `createdAt` and AT URIs / DIDs / URLs for links.
+
+## Tools, dev & deploy gotchas
+
+Use whatever frontend framework the user prefers. If they didn't pick one, a static **SvelteKit** app with **`@svelte-atproto/oauth`** is a quick default — after installing, read the **"Browser-only flow"**, **"Helpers"**, and **"Bsky helpers"** sections of its README, and add `@atcute/lexicons` (and `@atcute/atproto` for typed XRPC) directly so type checks find types like `Did`. One-line static SvelteKit setup: `adapter-static`, `ssr = false` + `prerender = true` in the root `+layout.ts`, a prerendered `/oauth-client-metadata.json/+server.ts`, and `server: { host: '127.0.0.1' }` in `vite.config.ts`. For other stacks, use **[atcute](https://github.com/mary-ext/atcute)** (`@atcute/oauth-browser-client`, `@atcute/client`) or **`@atproto/oauth-client-browser` + `@atproto/lex`** (needed for `@atproto/lex-space`).
+
+- **Dev host:** Loopback OAuth requires `http://127.0.0.1:<port>`, **not** `localhost`.
+- **Security & validation:** Never render record content as raw HTML (XSS compromises browser OAuth). Anyone can write any shape to their PDS — validate other people's records before showing them and skip bad ones.
+- **Lag & outages:** Microcosm services lag by a few seconds and are community-run — update the UI right after posting and degrade gracefully if a service is down.
+- **Deploy order (ask first!):** The sign-in `ORIGIN` is built into the app, so fix the final URL before building:
+  `pick a name → check it's free → set ORIGIN → build → wispctl deploy → wispctl domain claim-subdomain --site → verify /oauth-client-metadata.json loads`.
+- **Wisp & origins:** `wispctl` uses browser OAuth by default (no app password needed) and each account gets 3 free `https://<name>.wisp.place` subdomains. Pass `-y`, explicit flags, and `< /dev/null` so commands like `list` and `domain status` don't block on menu input; if `claim-subdomain` fails with `Upstream service unreachable`, one retry usually succeeds. Wisp also serves the site at `sites.wisp.place/<handle>/<site>` — tell the user to share **only the subdomain URL**. **Shared origins** (`sites.wisp.place/<handle>/<site>`, `<user>.github.io/<repo>`) also work (set the base path and include the subpath in `client_id`/`redirect_uris`), **but warn the user** that other sites on that origin can read browser OAuth storage and ask if that's fine (avoid for Spaces or broad scopes).
+- **Testing:** You can't complete interactive browser OAuth yourself, so verify the build and ask the user to test sign-in locally (`http://127.0.0.1:...`). Ask before deploying, claiming a subdomain, or publishing schemas.
