@@ -83,3 +83,25 @@
     "atproto": "did:key:zQ3shqbE6gAb5yxY665w8YQJ6inydUbpm3JEKFCWyHvSXc1jD"
   }
 }
+{
+  "alsoKnownAs": [
+    "at://flo-bit.dev"
+  ],
+  "prev": "bafyreibowjl7ewfv7w3qj6r5sp3h5mhz6s6rgufegdj3gqk2hpzdw4jhpe",
+  "rotationKeys": [
+    "did:key:zQ3shbi8a5JFqtGdjUAjnSET511ZKSxGVw9mDqcr2tNg7v5dL",
+    "did:key:zQ3shnJSPEXuJn5vVyXJDfbfb5AjkakGtcW3g93jXjyxUM4Nr"
+  ],
+  "services": {
+    "atproto_pds": {
+      "endpoint": "https://npmx.social",
+      "type": "AtprotoPersonalDataServer"
+    }
+  },
+  "sig": "pEnH9nQe_HiVX8W2JlenJoXVQ0i256BTl6GSrPeSoWZdFwzG18WnmVoYVWVeYWewcHgLr3NI8iiYfkR76mTTow",
+  "type": "plc_operation",
+  "verificationMethods": {
+    "atproto": "did:key:zQ3shqbE6gAb5yxY665w8YQJ6inydUbpm3JEKFCWyHvSXc1jD",
+    "atproto_kem": "did:key:zDnaeqq3UJGFCyPqDBBzDfeBzzr6zz9ru262Ty4744SWgqqoW"
+  }
+}
